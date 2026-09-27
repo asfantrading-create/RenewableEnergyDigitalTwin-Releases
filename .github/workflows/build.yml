@@ -1,0 +1,314 @@
+# Builds and publishes Renewable Energy Digital Twin releases.
+#
+# This workflow lives in the PUBLIC downloads repository on purpose: GitHub Actions minutes and artifact
+# storage are free and unlimited for public repositories, while the private source repository only has a
+# small monthly quota. The jobs check out the PRIVATE source repository with the SOURCE_TOKEN secret
+# (a fine-grained personal access token with "Contents: read and write" on both repositories), build the
+# installer and the PDF manuals, and create the release in both repositories – customers and the
+# auto-updater read this public repository, the private one keeps the same release for the record.
+#
+# Nothing secret is ever built here: the licence private key never leaves the vendor's computer
+# (the vendor kit is packaged locally with `npm run dist:vendor`). Logs of public repositories are
+# public, so the jobs never print file contents.
+#
+# Started by:
+#   - the private source repository (a tiny "dispatch" workflow on every push – ~1 minute of its quota)
+#   - "Run workflow" here, with the branch or commit of the source repository to build
+name: Build & publish release
+
+on:
+  workflow_dispatch:
+    inputs:
+      ref:
+        description: 'Branch, tag or commit of the source repository to build'
+        required: true
+        default: 'claude/renewable-energy-system-rae09w'
+  repository_dispatch:
+    types: [build-release]
+
+concurrency:
+  group: release-build
+  cancel-in-progress: false
+
+env:
+  SOURCE_REPO: asfantrading-create/RenewablEnergyDigitalTwingSoftware
+  SOURCE_REF: ${{ github.event_name == 'repository_dispatch' && github.event.client_payload.ref || inputs.ref }}
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out the source repository
+        uses: actions/checkout@v4
+        with:
+          repository: ${{ env.SOURCE_REPO }}
+          ref: ${{ env.SOURCE_REF }}
+          token: ${{ secrets.SOURCE_TOKEN }}
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+      - run: npm ci
+      - run: npm test
+      - run: npm run build
+
+  windows:
+    needs: test
+    runs-on: windows-latest
+    permissions:
+      contents: write
+    outputs:
+      version: ${{ steps.ver.outputs.version }}
+      tag: ${{ steps.tag.outputs.tag }}
+      published: ${{ steps.publish.outcome == 'success' }}
+    env:
+      # Code signing is optional. Add ONE of the two secret sets below in this repository's
+      # Settings → Secrets and variables → Actions and the installer will be signed automatically.
+      HAS_PFX: ${{ secrets.WIN_CSC_LINK != '' }}
+      HAS_AZURE: ${{ secrets.AZURE_CLIENT_ID != '' }}
+    steps:
+      - name: Check out the source repository
+        id: src
+        uses: actions/checkout@v4
+        with:
+          repository: ${{ env.SOURCE_REPO }}
+          ref: ${{ env.SOURCE_REF }}
+          token: ${{ secrets.SOURCE_TOKEN }}
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+      - run: npm ci
+      - name: Build renderer bundle
+        run: npm run build
+
+      # The auto-updater reads the releases of THIS (public) repository.
+      - name: Point the auto-updater at this repository
+        id: pub
+        shell: bash
+        run: |
+          echo "args=--config.publish.provider=github --config.publish.owner=${GITHUB_REPOSITORY%%/*} --config.publish.repo=${GITHUB_REPOSITORY##*/}" >> "$GITHUB_OUTPUT"
+          echo "Auto-updater will read releases from ${GITHUB_REPOSITORY}"
+
+      - name: Package (unsigned)
+        if: env.HAS_PFX != 'true' && env.HAS_AZURE != 'true'
+        run: npx electron-builder --win nsis portable --x64 --publish never ${{ steps.pub.outputs.args }}
+        env:
+          CSC_IDENTITY_AUTO_DISCOVERY: 'false'
+
+      - name: Package (signed with PFX certificate – OV/EV code-signing certificate)
+        if: env.HAS_PFX == 'true'
+        run: npx electron-builder --win nsis portable --x64 --publish never ${{ steps.pub.outputs.args }}
+        env:
+          WIN_CSC_LINK: ${{ secrets.WIN_CSC_LINK }}
+          WIN_CSC_KEY_PASSWORD: ${{ secrets.WIN_CSC_KEY_PASSWORD }}
+
+      - name: Package (signed with Azure Trusted Signing)
+        if: env.HAS_PFX != 'true' && env.HAS_AZURE == 'true'
+        run: >
+          npx electron-builder --win nsis portable --x64 --publish never
+          --config.win.azureSignOptions.endpoint="${{ secrets.AZURE_ENDPOINT }}"
+          --config.win.azureSignOptions.codeSigningAccountName="${{ secrets.AZURE_CODE_SIGNING_NAME }}"
+          --config.win.azureSignOptions.certificateProfileName="${{ secrets.AZURE_CERT_PROFILE_NAME }}"
+          ${{ steps.pub.outputs.args }}
+        env:
+          AZURE_TENANT_ID: ${{ secrets.AZURE_TENANT_ID }}
+          AZURE_CLIENT_ID: ${{ secrets.AZURE_CLIENT_ID }}
+          AZURE_CLIENT_SECRET: ${{ secrets.AZURE_CLIENT_SECRET }}
+
+      - name: Assemble customer package (EXE files + README + checksums – nothing else)
+        run: node scripts/package-dist.mjs customer
+
+      # Copies with version-less names → permanent links that always give the newest version, e.g.
+      # https://github.com/<owner>/<repo>/releases/latest/download/RenewableEnergyDigitalTwin-Setup.exe
+      - name: Stable-name copies for the permanent download links
+        shell: bash
+        run: |
+          mkdir -p release/stable
+          cp dist-customer/RenewableEnergyDigitalTwin-Setup-*.exe release/stable/RenewableEnergyDigitalTwin-Setup.exe
+          cp dist-customer/RenewableEnergyDigitalTwin-Portable-*.exe release/stable/RenewableEnergyDigitalTwin-Portable.exe
+          ls -l release/stable
+
+      - name: Upload customer package (build check – the release holds the same files)
+        uses: actions/upload-artifact@v4
+        continue-on-error: true
+        with:
+          name: renewable-energy-digital-twin-windows
+          path: dist-customer/**
+          if-no-files-found: error
+          retention-days: 3
+
+      - name: Read version from package.json
+        id: ver
+        shell: bash
+        run: |
+          echo "version=$(node -p "require('./package.json').version")" >> "$GITHUB_OUTPUT"
+          echo "sha=$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
+
+      - name: Release tag
+        id: tag
+        shell: bash
+        run: echo "tag=v${{ steps.ver.outputs.version }}" >> "$GITHUB_OUTPUT"
+
+      - name: Check whether v${{ steps.ver.outputs.version }} is already released
+        id: rel
+        shell: bash
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          if git ls-remote --exit-code --tags "https://x-access-token:${GH_TOKEN}@github.com/${GITHUB_REPOSITORY}.git" "refs/tags/v${{ steps.ver.outputs.version }}" > /dev/null 2>&1; then
+            echo "exists=true" >> "$GITHUB_OUTPUT"; echo "v${{ steps.ver.outputs.version }} already exists – build check only"
+          else
+            echo "exists=false" >> "$GITHUB_OUTPUT"; echo "v${{ steps.ver.outputs.version }} is new – it will be released"
+          fi
+
+      # A new version number in the source's package.json creates the GitHub Release: customer EXEs +
+      # README + checksums + latest.yml/blockmap, which installed copies download through auto-update.
+      # Created as a DRAFT (immutable releases: assets can only be added before publishing); the
+      # "manuals" jobs add the PDFs and the "publish" job makes it public.
+      - name: Create GitHub release (draft, this public downloads repository)
+        id: publish
+        if: steps.rel.outputs.exists == 'false'
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ steps.tag.outputs.tag }}
+          name: Renewable Energy Digital Twin v${{ steps.ver.outputs.version }}
+          draft: true
+          body: |
+            **Installer:** `RenewableEnergyDigitalTwin-Setup-${{ steps.ver.outputs.version }}.exe` – double-click to install (Windows 10/11 64-bit).
+            **Portable:** `RenewableEnergyDigitalTwin-Portable-${{ steps.ver.outputs.version }}.exe` – no installation.
+            **User manuals (PDF):** `RenewableEnergyDigitalTwin-UserManual-EN-v${{ steps.ver.outputs.version }}.pdf` (English) · `RenewableEnergyDigitalTwin-UserManual-AR-v${{ steps.ver.outputs.version }}.pdf` (Arabic).
+            **Permanent links (always the newest version):** `…/releases/latest/download/RenewableEnergyDigitalTwin-Setup.exe` · `…/RenewableEnergyDigitalTwin-Portable.exe` · `…/RenewableEnergyDigitalTwin-UserManual-EN.pdf` · `…/RenewableEnergyDigitalTwin-UserManual-AR.pdf`.
+            Installed copies update to this version automatically. `latest.yml` and `*.blockmap` are used by the auto-updater.
+
+            **المثبّت:** `RenewableEnergyDigitalTwin-Setup-${{ steps.ver.outputs.version }}.exe` – نقرة مزدوجة للتثبيت (ويندوز 10/11، 64 بت).
+            **النسخة المحمولة:** `RenewableEnergyDigitalTwin-Portable-${{ steps.ver.outputs.version }}.exe` – بدون تثبيت.
+            **دليل المستخدم (PDF):** `RenewableEnergyDigitalTwin-UserManual-AR-v${{ steps.ver.outputs.version }}.pdf` (بالعربية) · `RenewableEnergyDigitalTwin-UserManual-EN-v${{ steps.ver.outputs.version }}.pdf` (بالإنجليزية).
+            **روابط ثابتة (أحدث إصدار دائماً):** `…/releases/latest/download/RenewableEnergyDigitalTwin-Setup.exe` · `…/RenewableEnergyDigitalTwin-Portable.exe` · `…/RenewableEnergyDigitalTwin-UserManual-AR.pdf` · `…/RenewableEnergyDigitalTwin-UserManual-EN.pdf`.
+            النسخ المثبّتة تتحدّث إلى هذا الإصدار تلقائياً.
+          files: |
+            dist-customer/*.exe
+            dist-customer/*.txt
+            release/stable/*
+            release/latest.yml
+            release/*.blockmap
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      # The same release in the private source repository (for the record; tagged on the built commit)
+      - name: Create GitHub release (draft, private source repository)
+        if: steps.publish.outcome == 'success'
+        continue-on-error: true
+        uses: softprops/action-gh-release@v2
+        with:
+          repository: ${{ env.SOURCE_REPO }}
+          token: ${{ secrets.SOURCE_TOKEN }}
+          tag_name: ${{ steps.tag.outputs.tag }}
+          target_commitish: ${{ steps.ver.outputs.sha }}
+          name: Renewable Energy Digital Twin v${{ steps.ver.outputs.version }}
+          draft: true
+          body: |
+            Built from commit ${{ steps.ver.outputs.sha }} by the public downloads repository. Customers, the permanent links and the auto-updater use the release in ${{ github.repository }}.
+          files: |
+            dist-customer/*.exe
+            dist-customer/*.txt
+            release/stable/*
+            release/latest.yml
+            release/*.blockmap
+
+  # The customer user manuals (PDF) are generated from the built program: screenshots of every screen are
+  # taken in headless Chromium (software WebGL – slow, hence one job per language), printed to PDF and
+  # attached straight to the draft release(s). The "publish" job then makes the release public.
+  manuals:
+    needs: [test, windows]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    strategy:
+      fail-fast: false
+      matrix:
+        lang: [en, ar]
+    steps:
+      - name: Check out the source repository
+        uses: actions/checkout@v4
+        with:
+          repository: ${{ env.SOURCE_REPO }}
+          ref: ${{ env.SOURCE_REF }}
+          token: ${{ secrets.SOURCE_TOKEN }}
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+      - run: npm ci
+      - run: npm run build
+      - name: Install Chromium for the manual screenshots
+        run: npx playwright install --with-deps chromium
+      - name: Build the ${{ matrix.lang }} user manual (PDF)
+        run: node scripts/build-manual.mjs --lang ${{ matrix.lang }} --quality high
+      - name: Version-less copy for the permanent link
+        shell: bash
+        run: |
+          mkdir -p release/stable
+          L=$(echo "${{ matrix.lang }}" | tr a-z A-Z)
+          f=$(ls docs/manual/out/RenewableEnergyDigitalTwin-UserManual-$L-v*.pdf | head -1)
+          cp "$f" "release/stable/RenewableEnergyDigitalTwin-UserManual-$L.pdf"
+          ls -l docs/manual/out/*.pdf release/stable
+
+      - name: Attach the manual to the draft release (this repository)
+        if: needs.windows.outputs.published == 'true'
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ needs.windows.outputs.tag }}
+          draft: true
+          files: |
+            docs/manual/out/*.pdf
+            release/stable/*.pdf
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Attach the manual to the draft release (private source repository)
+        if: needs.windows.outputs.published == 'true'
+        continue-on-error: true
+        uses: softprops/action-gh-release@v2
+        with:
+          repository: ${{ env.SOURCE_REPO }}
+          token: ${{ secrets.SOURCE_TOKEN }}
+          tag_name: ${{ needs.windows.outputs.tag }}
+          draft: true
+          files: |
+            docs/manual/out/*.pdf
+            release/stable/*.pdf
+
+      - name: Upload user manual (build check)
+        if: needs.windows.outputs.published != 'true'
+        uses: actions/upload-artifact@v4
+        continue-on-error: true
+        with:
+          name: user-manual-${{ matrix.lang }}
+          path: docs/manual/out/*.pdf
+          retention-days: 3
+
+  # Everything is attached → publish. Only now do customers, the permanent links and the auto-updater see
+  # the new version (drafts are invisible to all of them).
+  publish:
+    needs: [windows, manuals]
+    if: needs.windows.outputs.published == 'true'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - name: Publish the release (this repository)
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ needs.windows.outputs.tag }}
+          draft: false
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      - name: Publish the release (private source repository)
+        continue-on-error: true
+        uses: softprops/action-gh-release@v2
+        with:
+          repository: ${{ env.SOURCE_REPO }}
+          token: ${{ secrets.SOURCE_TOKEN }}
+          tag_name: ${{ needs.windows.outputs.tag }}
+          draft: false
