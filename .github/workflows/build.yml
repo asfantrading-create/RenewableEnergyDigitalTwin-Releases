@@ -178,13 +178,15 @@ jobs:
             **Installer:** `RenewableEnergyDigitalTwin-Setup-${{ steps.ver.outputs.version }}.exe` – double-click to install (Windows 10/11 64-bit).
             **Portable:** `RenewableEnergyDigitalTwin-Portable-${{ steps.ver.outputs.version }}.exe` – no installation.
             **User manuals (PDF):** `RenewableEnergyDigitalTwin-UserManual-EN-v${{ steps.ver.outputs.version }}.pdf` (English) · `RenewableEnergyDigitalTwin-UserManual-AR-v${{ steps.ver.outputs.version }}.pdf` (Arabic).
-            **Permanent links (always the newest version):** `…/releases/latest/download/RenewableEnergyDigitalTwin-Setup.exe` · `…/RenewableEnergyDigitalTwin-Portable.exe` · `…/RenewableEnergyDigitalTwin-UserManual-EN.pdf` · `…/RenewableEnergyDigitalTwin-UserManual-AR.pdf`.
+            **Mac:** `RenewableEnergyDigitalTwin-Mac-${{ steps.ver.outputs.version }}.dmg` – one file for every Mac (Apple silicon and Intel, macOS 13 or newer); open it and drag the program into Applications. First start: System Settings → Privacy & Security → Open Anyway (once).
+            **Permanent links (always the newest version):** `…/releases/latest/download/RenewableEnergyDigitalTwin-Setup.exe` · `…/RenewableEnergyDigitalTwin-Portable.exe` · `…/RenewableEnergyDigitalTwin-Mac.dmg` · `…/RenewableEnergyDigitalTwin-UserManual-EN.pdf` · `…/RenewableEnergyDigitalTwin-UserManual-AR.pdf`.
             Installed copies update to this version automatically. `latest.yml` and `*.blockmap` are used by the auto-updater.
 
             **المثبّت:** `RenewableEnergyDigitalTwin-Setup-${{ steps.ver.outputs.version }}.exe` – نقرة مزدوجة للتثبيت (ويندوز 10/11، 64 بت).
             **النسخة المحمولة:** `RenewableEnergyDigitalTwin-Portable-${{ steps.ver.outputs.version }}.exe` – بدون تثبيت.
             **دليل المستخدم (PDF):** `RenewableEnergyDigitalTwin-UserManual-AR-v${{ steps.ver.outputs.version }}.pdf` (بالعربية) · `RenewableEnergyDigitalTwin-UserManual-EN-v${{ steps.ver.outputs.version }}.pdf` (بالإنجليزية).
-            **روابط ثابتة (أحدث إصدار دائماً):** `…/releases/latest/download/RenewableEnergyDigitalTwin-Setup.exe` · `…/RenewableEnergyDigitalTwin-Portable.exe` · `…/RenewableEnergyDigitalTwin-UserManual-AR.pdf` · `…/RenewableEnergyDigitalTwin-UserManual-EN.pdf`.
+            **نسخة Mac:** `RenewableEnergyDigitalTwin-Mac-${{ steps.ver.outputs.version }}.dmg` – ملف واحد لكل أجهزة Mac (معالج Apple أو Intel، ‏macOS 13 أو أحدث)؛ افتحه واسحب البرنامج إلى Applications. التشغيل الأول: إعدادات النظام ← الخصوصية والأمان ← Open Anyway (مرة واحدة).
+            **روابط ثابتة (أحدث إصدار دائماً):** `…/releases/latest/download/RenewableEnergyDigitalTwin-Setup.exe` · `…/RenewableEnergyDigitalTwin-Portable.exe` · `…/RenewableEnergyDigitalTwin-Mac.dmg` · `…/RenewableEnergyDigitalTwin-UserManual-AR.pdf` · `…/RenewableEnergyDigitalTwin-UserManual-EN.pdf`.
             النسخ المثبّتة تتحدّث إلى هذا الإصدار تلقائياً.
           files: |
             dist-customer/*.exe
@@ -288,10 +290,89 @@ jobs:
           path: docs/manual/out/*.pdf
           retention-days: 3
 
+  # The Mac version: one DMG for Apple silicon and Intel Macs (macOS 13 or newer), built on a macOS runner
+  # (free for public repositories) and attached to the same draft release(s). Not notarised yet (no Apple
+  # Developer ID): ad-hoc signature; customers allow the first start once (manual, chapter 5).
+  mac:
+    needs: [test, windows]
+    runs-on: macos-latest
+    permissions:
+      contents: write
+    steps:
+      - name: Check out the source repository
+        uses: actions/checkout@v4
+        with:
+          repository: ${{ env.SOURCE_REPO }}
+          ref: ${{ env.SOURCE_REF }}
+          token: ${{ secrets.SOURCE_TOKEN }}
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+      - run: npm ci
+      - run: npm run build
+
+      # The app's update check reads the releases of THIS (public) repository.
+      - name: Package (universal DMG)
+        shell: bash
+        run: npx electron-builder --mac --universal --publish never --config.publish.provider=github --config.publish.owner=${GITHUB_REPOSITORY%%/*} --config.publish.repo=${GITHUB_REPOSITORY##*/}
+
+      - name: Check the app and start it once
+        shell: bash
+        run: |
+          APP="release/mac-universal/Renewable Energy Digital Twin.app"
+          lipo -archs "$APP/Contents/MacOS/Renewable Energy Digital Twin"
+          codesign --verify --deep --strict "$APP"
+          grep -q "repo: ${GITHUB_REPOSITORY##*/}" "$APP/Contents/Resources/app-update.yml"
+          node scripts/mac-smoke.mjs "$APP" smoke
+
+      - name: Stable-name copy for the permanent download link
+        shell: bash
+        run: |
+          mkdir -p release/stable
+          cp release/RenewableEnergyDigitalTwin-Mac-*.dmg release/stable/RenewableEnergyDigitalTwin-Mac.dmg
+          ls -l release/*.dmg release/stable
+
+      - name: Attach the Mac version to the draft release (this repository)
+        if: needs.windows.outputs.published == 'true'
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ needs.windows.outputs.tag }}
+          draft: true
+          files: |
+            release/RenewableEnergyDigitalTwin-Mac-*.dmg
+            release/stable/RenewableEnergyDigitalTwin-Mac.dmg
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Attach the Mac version to the draft release (private source repository)
+        if: needs.windows.outputs.published == 'true'
+        continue-on-error: true
+        uses: softprops/action-gh-release@v2
+        with:
+          repository: ${{ env.SOURCE_REPO }}
+          token: ${{ secrets.SOURCE_TOKEN }}
+          tag_name: ${{ needs.windows.outputs.tag }}
+          draft: true
+          files: |
+            release/RenewableEnergyDigitalTwin-Mac-*.dmg
+            release/stable/RenewableEnergyDigitalTwin-Mac.dmg
+
+      - name: Upload the Mac version (build check)
+        if: needs.windows.outputs.published != 'true'
+        uses: actions/upload-artifact@v4
+        continue-on-error: true
+        with:
+          name: renewable-energy-digital-twin-mac
+          path: |
+            release/*.dmg
+            smoke/
+          retention-days: 3
+
   # Everything is attached → publish. Only now do customers, the permanent links and the auto-updater see
   # the new version (drafts are invisible to all of them).
   publish:
-    needs: [windows, manuals]
+    needs: [windows, manuals, mac]
     if: needs.windows.outputs.published == 'true'
     runs-on: ubuntu-latest
     permissions:
