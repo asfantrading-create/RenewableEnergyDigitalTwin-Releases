@@ -223,7 +223,8 @@ jobs:
   # attached straight to the draft release(s). The "publish" job then makes the release public.
   manuals:
     needs: [test, windows]
-    runs-on: ubuntu-latest
+    # ubuntu-latest is Ubuntu 26.04, for which Playwright (the manual screenshots) has no Chromium yet
+    runs-on: ubuntu-24.04
     permissions:
       contents: write
     strategy:
